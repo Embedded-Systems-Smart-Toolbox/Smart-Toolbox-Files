@@ -1,144 +1,108 @@
-#include <msp430.h> 
+#include <msp430.h>
+#include <driverlib.h>
+#include "StopWatchMode.h"
+#include "TempSensorMode.h"
+#include "hal_LCD.h"
 
+#define STARTUP_MODE         0
 
-#define ENABLE_PINS 0xFFFE // Enables inputs and outputs
+volatile unsigned char mode = STARTUP_MODE;
+volatile unsigned char stopWatchRunning = 0;
+volatile unsigned char tempSensorRunning = 0;
+volatile unsigned char S1buttonDebounce = 0;
+volatile unsigned char S2buttonDebounce = 0;
+volatile unsigned int holdCount = 0;
+volatile unsigned int counter = 0;
+volatile int centisecond = 0;
+Calendar currentTime;
 
-unsigned int ADC_value0 = 0;
-unsigned int ADC_value1 = 0;
-
-#include <driverlib.h> // Required for the LCD
-#include "myGpio.h" // Required for the LCD
-#include "myClocks.h" // Required for the LCD
-#include "myLcd.h" // Required for the LCD
-
-/**
- * main.c
- */
-
-/*
- * 1.4  button 1
- * 1.5  button 2
- * 1.6  button 3
- * 1.7  button 4
- *
- * 4.7  solenoid / LED string
- *
- * 8.1  buzzer
- *
- * 2.7  LCD button
- *
- * 9.1  force resistor 1
- * 9.2  force resistor 2
- *
- */
-
-void ScrollWords(char words[250])
+// TimerA0 UpMode Configuration Parameter
+Timer_A_initUpModeParam initUpParam_A0 =
 {
-unsigned int length; // Contains length of message to be displayed
-unsigned int slot; // Slot to be displayed on LCD (1, 2, 3, 4, 5, or 6)
-unsigned int amount_shifted; // Number of times message shifted so far
-unsigned int offset; // Used with amount_shifted to get correct character to display
-unsigned long delay; // Used to implement delay between scrolling iterations
-unsigned char next_char; // Next character from message to be displayed
-length = strlen(words); // Get the length of the message stored in words
-amount_shifted=0; // We have not shifted the message yet
-offset=0; // There is no offset yet
-while( amount_shifted < length+7 ) // Loop as long as you haven't shifted all
-{ // of the characters off the LCD screen
-offset=amount_shifted; // Starting point in message for next LCD update
-for(slot = 1;slot<=6;slot++) // Loop 6 times to display 6 characters at a time
+        TIMER_A_CLOCKSOURCE_SMCLK,              // SMCLK Clock Source
+        TIMER_A_CLOCKSOURCE_DIVIDER_1,          // SMCLK/4 = 2MHz
+        30000,                                  // 15ms debounce period
+        TIMER_A_TAIE_INTERRUPT_DISABLE,         // Disable Timer interrupt
+        TIMER_A_CCIE_CCR0_INTERRUPT_ENABLE ,    // Enable CCR0 interrupt
+        TIMER_A_DO_CLEAR,                       // Clear value
+        true                                    // Start Timer
+};
+
+// Initialization calls
+void Init_GPIO(void);
+void Init_Clock(void);
+
+#define ENABLE_PINS 0xFFFE // Required to use inputs and outputs
+#define UART_CLK_SEL 0x0080 // Specifies accurate SMCLK clock for UART
+#define BR0_FOR_9600 0x34 // Value required to use 9600 baud
+#define BR1_FOR_9600 0x00 // Value required to use 9600 baud
+#define CLK_MOD 0x4911 // Microcontroller will "clean-up" clock signal
+
+volatile int tape = 0;
+volatile int screwdriver = 0;
+
+void select_clock_signals(void)
 {
-next_char = words[offset-6]; // Get the current character for LCD slot
-if(next_char && (offset>=6) && (offset<=length+6) ) // If character is not null AND
-{ // LCD is not filled (offset>=6) AND
-// You have not reached end of message
-// (offset<=length+6)
-myLCD_showChar(next_char,slot); // Show the next character on the LCD
-// screen in correct slot
-}
-else // Else, slot on LCD should be blank
-{
-myLCD_showChar(' ',slot); // So, add a blank space to slot
-}
-offset++; // Update as you move across the message
-}
-for(delay=0 ; delay<123456 ; delay=delay+1); // Delay between shifts
-amount_shifted = amount_shifted + 1; // Update times words shifted across LCD
-}
+CSCTL0 = 0xA500; // "Password" to access clock calibration registers
+CSCTL1 = 0x0046; // Specifies frequency of main clock
+CSCTL2 = 0x0133; // Assigns additional clock signals
+CSCTL3 = 0x0000; // Use clocks at intended frequency, do not slow them down
 }
 
-#pragma vector=PORT2_VECTOR
-__interrupt void Port_2(void)           //button interrupt
+void assign_pins_to_uart(void)
 {
-    if ((P2IN & BIT7) != BIT7)
-    {
-        if (((P4IN & BIT2) != BIT2) && ((P4IN & BIT3) != BIT3))
-        {
-            ScrollWords("SCREWDRIVER HERE HAMMER HERE");
-        }
-        else if (((P4IN & BIT2) == BIT2) && ((P4IN & BIT3) != BIT3))
-        {
-            ScrollWords("SCREWDRIVER NOT HERE HAMMER HERE");
-        }
-        else if (((P4IN & BIT2) != BIT2) && ((P4IN & BIT3) == BIT3))
-        {
-            ScrollWords("SCREWDRIVER HERE HAMMER NOT HERE");
-        }
-        else
-        {
-            ScrollWords("SCREWDRIVER NOT HERE HAMMER NOT HERE");
-        }
-    }
+P4SEL1 = 0x00; // 0000 0000
+P4SEL0 = BIT3 | BIT2; // 0000 1100
+// ^^
+// ||
+// |+---- 01 assigns P4.2 to UART Transmit (TXD)
+
+// |
+
+// +----- 01 assigns P4.3 to UART Receive (RXD)
+
 }
 
+void use_9600_baud(void)
+{
+UCA0CTLW0 = UCSWRST; // Put UART into SoftWare ReSeT
+UCA0CTLW0 = UCA0CTLW0 | UART_CLK_SEL; // Specifies clock source for UART
+UCA0BR0 = BR0_FOR_9600; // Specifies bit rate (baud) of 9600
+UCA0BR1 = BR1_FOR_9600; // Specifies bit rate (baud) of 9600
+UCA0MCTLW = CLK_MOD; // "Cleans" clock signal
+UCA0CTLW0 = UCA0CTLW0 & (~UCSWRST); // Takes UART out of SoftWare ReSeT
+}
+
+void lock_control(void)
+{
+    P1DIR &= 0x0F;                         //input
+
+    P1IE |= 0xF0;                          //enable interrupt
+    P1IES |= 0xF0;                         //enable interrupt on falling edge
+    P1IFG &= 0x0F;                         //clear IFG
+
+    P4DIR |= BIT7;
+    P4OUT &= ~BIT7;                         //lock
+
+
+}
 
 void timer_setup(void)
 {
-    TA0CCR0 = 1000;       //Duty Cycle @ 100%
-    TA0CCTL1 = OUTMOD_7;  //Sets output mode for timer
-    TA0CCR1 = 0;       //Duty Cycle @ 0%
-    TA0CTL = TASSEL_2 + MC_1; //Timer Instantiation
+    TA1CCR0 = 1000;             //100% duty cycle
+    TA1CCTL1 = OUTMOD_7;        //set output mode
+    TA1CCR1 = 0;                //0% duty cycle
+    TA1CTL = TASSEL_2 + MC_1;   //set up timer
+
+    P1SEL0 |= BIT0;              //enable pwm
 
 }
-void lock_control(void)
-{
-    P8DIR |= BIT1;                          //Sets P1.0 as an output
-    P8SEL0 |= BIT1;                         //Sets P1.0 to select PWM
 
-    P1REN |= BIT4;                          // enable resistor
-    P1OUT |= BIT4;                          // set P8.4 to input
+unsigned int ADC_value0 = 0;
+unsigned int ADC_value1 = 0;
+unsigned int weight1 = 0;
+unsigned int weight2 = 0;
 
-    P1REN |= BIT5;                          // enable resistor
-    P1OUT |= BIT5;                          // set P8.5 to input
-
-    P1REN |= BIT6;                          // enable resistor
-    P1OUT |= BIT6;                          // set P8.6 to input
-
-    P1REN |= BIT7;                          // enable resistor
-    P1OUT |= BIT7;                          // set P8.7 to input
-
-    P1IE |= BIT4;                           //enable interrupt
-    P1IES |= BIT4;                          //enable interrupt on rising edge
-    P1IFG &= ~BIT4;                         //clear IFG
-
-    P1IE |= BIT5;                           //enable interrupt
-    P1IES |= BIT5;                          //enable interrupt on rising edge
-    P1IFG &= ~BIT5;                         //clear IFG
-
-    P1IE |= BIT6;                           //enable interrupt
-    P1IES |= BIT6;                          //enable interrupt on rising edge
-    P1IFG &= ~BIT6;                         //clear IFG
-
-    P1IE |= BIT7;                           //enable interrupt
-    P1IES |= BIT7;                          //enable interrupt on rising edge
-    P1IFG &= ~BIT7;                         //clear IFG
-
-    P4OUT &= ~BIT7;                          //lock
-
-    __enable_interrupt();
-
-
-}
 void ADC_SETUP(void)
 {
     P9SEL1 |= BIT1; // Configure P9.1 for ADC
@@ -162,60 +126,21 @@ void ADC_SETUP(void)
 
 }
 
-#pragma vector=PORT1_VECTOR
-__interrupt void Por1_1(void)           //button interrupt
+void main()
 {
-    if (((P1IN & BIT6) != BIT6) && ((P1IN & BIT5) != BIT5) && ((P1IN & BIT7) == BIT7) && ((P1IN & BIT3) == BIT3)) // if button only 1 and 4 are pressed
-    {
-        P4OUT |= BIT7;                          //unlock and lights on
-        P1IFG &= ~BIT4;                         //clear IFG
-        P1IFG &= ~BIT5;                         //clear IFG
-        P1IFG &= ~BIT6;                         //clear IFG
-        P1IFG &= ~BIT7;                         //clear IFG
-        __delay_cycles(3000000);                 //delay before locking again
-        P4OUT &= ~BIT7;
-    }
-    else
-    {
-        __delay_cycles(1000000);
-        TA0CCR1 = 1000;                          //buzzer on
-        __delay_cycles(100000);
-        TA0CCR1 = 0;                         //buzzer off
-    }
+    WDTCTL = WDTPW | WDTHOLD;   // stop watchdog timer
+    PM5CTL0 &= ~LOCKLPM5;
 
-    if ((P2IN & BIT7) != BIT7)
-    {
-        if (((P9IN & BIT2) != BIT2) && ((P9IN & BIT1) != BIT1))
-        {
-            ScrollWords("SCREWDRIVER HERE HAMMER HERE");
-        }
-        else if (((P9IN & BIT2) == BIT2) && ((P9IN & BIT1) != BIT1))
-        {
-            ScrollWords("SCREWDRIVER NOT HERE HAMMER HERE");
-        }
-        else if (((P9IN & BIT2) != BIT2) && ((P9IN & BIT1) == BIT1))
-        {
-            ScrollWords("SCREWDRIVER HERE HAMMER NOT HERE");
-        }
-        else
-        {
-            ScrollWords("SCREWDRIVER NOT HERE HAMMER NOT HERE");
-        }
-    }
-}
-
-
-int main(void)
-{
-	WDTCTL = WDTPW | WDTHOLD;	// stop watchdog timer
-	
-    PM5CTL0 &= ~LOCKLPM5;                   // Disable the GPIO power-on default high-impedance mode
-                                            // to activate previously configured port settings
-
-    PM5CTL0 = ENABLE_PINS; // Enable inputs and outputs
+    //Initializations
+    Init_GPIO();
+    Init_Clock();
+    Init_LCD();
     ADC_SETUP(); // Sets up ADC peripheral
-    timer_setup();                          //instantiates timer_setup
-    lock_control();                         //instantiate lock_control function
+    assign_pins_to_uart(); // P4.2 is for TXD, P4.3 is for RXD
+    use_9600_baud(); // UART operates at 9600 bits/second
+    lock_control();
+    timer_setup();
+
 
     while(1)
     {
@@ -226,5 +151,175 @@ int main(void)
             ADC_value0 = ADC12MEM0; // Save MEM0
             ADC_value1 = ADC12MEM1; // Save MEM1
 
+
+                        weight1 = ADC_value0;
+                        weight2 = ADC_value1;
+
+                        if((weight1 >= 2000) || (weight2 >= 2000))
+                        {
+                            tape = 1;
+                            screwdriver = 0;
+                        }
+                        if(weight2 >= 750 && weight2 <= 2000)
+                        {
+                            screwdriver = 1;
+                        }
+                        if(weight1 > 750 && weight1 < 2000)
+                        {
+                            screwdriver = 1;
+                        }
+                        if(weight1 < 750 && weight2 < 750)
+                        {
+                            screwdriver = 0;
+                            tape = 0;
+                        }
+
+
+        if((~P1IN & 0x02)==0x02)
+        {
+            Init_Clock();
+
+                        if(tape == 1 && screwdriver == 1)
+                        {
+                            displayScrollText("TAPE HERE SCREWDRIVER HERE");
+
+                        }
+                        else if(tape == 0 && screwdriver == 1)
+                        {
+                            displayScrollText("TAPE NOT HERE SCREWDRIVER HERE");
+
+                        }
+                        else if(tape == 1 && screwdriver == 0)
+                        {
+                            displayScrollText("TAPE HERE SCREWDRIVER NOTHERE");
+
+                        }
+                        else if(tape == 0 && screwdriver == 0)
+                        {
+                            displayScrollText("TAPE NOT HERE SCREWDRIVER NOT HERE");
+
+                        }
+        }
+        select_clock_signals(); // Assigns microcontroller clock signals
+
+                                if(tape == 1 && screwdriver == 1)
+                                {
+
+                                            UCA0TXBUF = 0x0000;
+                                }
+                                else if(tape == 0 && screwdriver == 1)
+                                {
+
+                                            UCA0TXBUF = 0x0010;
+                                }
+                                else if(tape == 1 && screwdriver == 0)
+                                {
+
+                                            UCA0TXBUF = 0x0001;
+                                }
+                                else if(tape == 0 && screwdriver == 0)
+                                {
+
+                                            UCA0TXBUF = 0x0011;
+                                }
+
+    if ((P1IN & 0xF0)==0x90) // if button only 1 and 4 are pressed
+    {
+        P4OUT |= BIT7;                          //unlock
+        P1IFG &= 0x0F;                         //clear IFG
+        __delay_cycles(10000000);                //delay before locking again
+        P4OUT &= ~BIT7;
+    }
+
+
+   }
+}
+
+
+/*
+ * GPIO Initialization
+ */
+void Init_GPIO()
+{
+    // Set all GPIO pins to output low to prevent floating input and reduce power consumption
+    GPIO_setOutputLowOnPin(GPIO_PORT_P1, GPIO_PIN0|GPIO_PIN1|GPIO_PIN2|GPIO_PIN3|GPIO_PIN4|GPIO_PIN5|GPIO_PIN6|GPIO_PIN7);
+    GPIO_setOutputLowOnPin(GPIO_PORT_P2, GPIO_PIN0|GPIO_PIN1|GPIO_PIN2|GPIO_PIN3|GPIO_PIN4|GPIO_PIN5|GPIO_PIN6|GPIO_PIN7);
+    GPIO_setOutputLowOnPin(GPIO_PORT_P3, GPIO_PIN0|GPIO_PIN1|GPIO_PIN2|GPIO_PIN3|GPIO_PIN4|GPIO_PIN5|GPIO_PIN6|GPIO_PIN7);
+    GPIO_setOutputLowOnPin(GPIO_PORT_P4, GPIO_PIN0|GPIO_PIN1|GPIO_PIN2|GPIO_PIN3|GPIO_PIN4|GPIO_PIN5|GPIO_PIN6|GPIO_PIN7);
+    GPIO_setOutputLowOnPin(GPIO_PORT_P5, GPIO_PIN0|GPIO_PIN1|GPIO_PIN2|GPIO_PIN3|GPIO_PIN4|GPIO_PIN5|GPIO_PIN6|GPIO_PIN7);
+    GPIO_setOutputLowOnPin(GPIO_PORT_P6, GPIO_PIN0|GPIO_PIN1|GPIO_PIN2|GPIO_PIN3|GPIO_PIN4|GPIO_PIN5|GPIO_PIN6|GPIO_PIN7);
+    GPIO_setOutputLowOnPin(GPIO_PORT_P7, GPIO_PIN0|GPIO_PIN1|GPIO_PIN2|GPIO_PIN3|GPIO_PIN4|GPIO_PIN5|GPIO_PIN6|GPIO_PIN7);
+    GPIO_setOutputLowOnPin(GPIO_PORT_P8, GPIO_PIN0|GPIO_PIN1|GPIO_PIN2|GPIO_PIN3|GPIO_PIN4|GPIO_PIN5|GPIO_PIN6|GPIO_PIN7);
+    GPIO_setOutputLowOnPin(GPIO_PORT_P9, GPIO_PIN0|GPIO_PIN1|GPIO_PIN2|GPIO_PIN3|GPIO_PIN4|GPIO_PIN5|GPIO_PIN6|GPIO_PIN7);
+
+    GPIO_setAsOutputPin(GPIO_PORT_P1, GPIO_PIN0|GPIO_PIN1|GPIO_PIN2|GPIO_PIN3|GPIO_PIN4|GPIO_PIN5|GPIO_PIN6|GPIO_PIN7);
+    GPIO_setAsOutputPin(GPIO_PORT_P2, GPIO_PIN0|GPIO_PIN1|GPIO_PIN2|GPIO_PIN3|GPIO_PIN4|GPIO_PIN5|GPIO_PIN6|GPIO_PIN7);
+    GPIO_setAsOutputPin(GPIO_PORT_P3, GPIO_PIN0|GPIO_PIN1|GPIO_PIN2|GPIO_PIN3|GPIO_PIN4|GPIO_PIN5|GPIO_PIN6|GPIO_PIN7);
+    GPIO_setAsOutputPin(GPIO_PORT_P4, GPIO_PIN0|GPIO_PIN1|GPIO_PIN2|GPIO_PIN3|GPIO_PIN4|GPIO_PIN5|GPIO_PIN6|GPIO_PIN7);
+    GPIO_setAsOutputPin(GPIO_PORT_P5, GPIO_PIN0|GPIO_PIN1|GPIO_PIN2|GPIO_PIN3|GPIO_PIN4|GPIO_PIN5|GPIO_PIN6|GPIO_PIN7);
+    GPIO_setAsOutputPin(GPIO_PORT_P6, GPIO_PIN0|GPIO_PIN1|GPIO_PIN2|GPIO_PIN3|GPIO_PIN4|GPIO_PIN5|GPIO_PIN6|GPIO_PIN7);
+    GPIO_setAsOutputPin(GPIO_PORT_P7, GPIO_PIN0|GPIO_PIN1|GPIO_PIN2|GPIO_PIN3|GPIO_PIN4|GPIO_PIN5|GPIO_PIN6|GPIO_PIN7);
+    GPIO_setAsOutputPin(GPIO_PORT_P8, GPIO_PIN0|GPIO_PIN1|GPIO_PIN2|GPIO_PIN3|GPIO_PIN4|GPIO_PIN5|GPIO_PIN6|GPIO_PIN7);
+    GPIO_setAsOutputPin(GPIO_PORT_P9, GPIO_PIN0|GPIO_PIN1|GPIO_PIN2|GPIO_PIN3|GPIO_PIN4|GPIO_PIN5|GPIO_PIN6|GPIO_PIN7);
+
+    GPIO_setAsInputPin(GPIO_PORT_P3, GPIO_PIN5);
+
+    // Configure button S1 (P1.1) interrupt
+    GPIO_selectInterruptEdge(GPIO_PORT_P1, GPIO_PIN1, GPIO_HIGH_TO_LOW_TRANSITION);
+    GPIO_setAsInputPinWithPullUpResistor(GPIO_PORT_P1, GPIO_PIN1);
+    GPIO_clearInterrupt(GPIO_PORT_P1, GPIO_PIN1);
+    GPIO_enableInterrupt(GPIO_PORT_P1, GPIO_PIN1);
+
+    // Configure button S2 (P1.2) interrupt
+    GPIO_selectInterruptEdge(GPIO_PORT_P1, GPIO_PIN2, GPIO_HIGH_TO_LOW_TRANSITION);
+    GPIO_setAsInputPinWithPullUpResistor(GPIO_PORT_P1, GPIO_PIN2);
+    GPIO_clearInterrupt(GPIO_PORT_P1, GPIO_PIN2);
+    GPIO_enableInterrupt(GPIO_PORT_P1, GPIO_PIN2);
+
+    // Set P4.1 and P4.2 as Secondary Module Function Input, LFXT.
+    GPIO_setAsPeripheralModuleFunctionInputPin(
+           GPIO_PORT_PJ,
+           GPIO_PIN4 + GPIO_PIN5,
+           GPIO_PRIMARY_MODULE_FUNCTION
+           );
+
+    // Disable the GPIO power-on default high-impedance mode
+    // to activate previously configured port settings
+    PMM_unlockLPM5();
+}
+
+/*
+ * Clock System Initialization
+ */
+void Init_Clock()
+{
+    // Set DCO frequency to default 8MHz
+    CS_setDCOFreq(CS_DCORSEL_0, CS_DCOFSEL_6);
+
+    // Configure MCLK and SMCLK to default 2MHz
+    CS_initClockSignal(CS_MCLK, CS_DCOCLK_SELECT, CS_CLOCK_DIVIDER_8);
+    CS_initClockSignal(CS_SMCLK, CS_DCOCLK_SELECT, CS_CLOCK_DIVIDER_8);
+
+    // Intializes the XT1 crystal oscillator
+    CS_turnOnLFXT(CS_LFXT_DRIVE_3);
+}
+
+#pragma vector=PORT1_VECTOR
+__interrupt void Por1_1(void)           //button interrupt
+{
+    if ((P1IN & 0x90)!=0x90) // if button only 1 and 4 are pressed
+    {
+        P4OUT |= BIT7;                          //unlock
+        P1IFG &= 0x0F;                         //clear IFG
+        __delay_cycles(3000000);                //delay before locking again
+        P4OUT &= ~BIT7;
+    }
+    else
+    {
+        __delay_cycles(1000000);
+        TA0CCR1 = 1000;                      //buzzer on
+        __delay_cycles(100000);
+        TA0CCR1 = 0;                         //buzzer off
     }
 }
+
